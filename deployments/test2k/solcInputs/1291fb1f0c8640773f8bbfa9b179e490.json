@@ -1,0 +1,56 @@
+{
+  "language": "Solidity",
+  "sources": {
+    "contracts/interfaces/ILetsFilRaiseFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\nimport './ILetsFilRaiseInfo.sol';\ninterface ILetsFilRaiseFactory is ILetsFilRaiseInfo {\n\n    struct RaisePlan {\n        address sponsor; //发起人地址\n        uint64 minerId; //minerID\n        uint256 raiseId; //募集ID\n        address raiseAddress; //募集计划ID\n    }\n   \n}"
+    },
+    "contracts/interfaces/ILetsFilRaiseInfo.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\ninterface ILetsFilRaiseInfo {\n    struct RaiseInfo {\n        uint256 id;             // 募集ID，合约内递增唯一标识\n        uint256 targetAmount;   // 募集目标\n        uint256 securityFund;   // 保证金\n        uint256 securityFundRate; // 保证金比例\n        uint256 deadline;       // 募集截止时间\n        uint256 raiserShare;    // 募集者权益\n        uint256 investorShare;  // 投资者权益\n        uint256 servicerShare;  // 服务商权益\n        address sponsor;        // 发起人地址\n        uint256 companyId;      //发起单位id\n    }\n\n    struct NodeInfo {\n        uint256 nodeSize;           // 节点大小\n        uint256 sectorSize;         // 扇区大小\n        uint256 sealPeriod;         // 封装周期\n        uint256 nodePeriod;         // 节点有效期\n        uint256 opsSecurityFund;    // 运维保证金\n        address manager;            // 通过创建合约单独指定\n        address opsSecurityFundPayer; // 缴纳运维保证金地址\n        uint64 minerID;             // Miner ID\n    }\n}\n"
+    },
+    "contracts/interfaces/ILetsFilRaisePlan.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\nimport './ILetsFilRaiseInfo.sol';\n\ninterface ILetsFilRaisePlan is ILetsFilRaiseInfo {\n\n}\n"
+    },
+    "contracts/LetsFilRaiseFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\nimport \"./NoDelegateCall.sol\";\nimport \"./interfaces/ILetsFilRaiseFactory.sol\";\nimport \"./LetsFilRaisePlan.sol\";\n\ncontract LetsFilRaiseFactory is ILetsFilRaiseFactory, NoDelegateCall {\n\n    event eCreateRaisePlan(address raisePool, address caller, uint256 payValue, RaiseInfo raiseInfo, NodeInfo nodeInfo, uint256 raiseID);\n    event eTest(address addr);\n\n    //raise plan ID\n    uint256 private raiseID;\n    // minerId => raiseId[], all inactive raise plan\n    mapping(uint64 => uint256[]) private inactivePlan;\n    // minerId => raiseId, running plan\n    mapping(uint64 => uint256) private activePlan;\n    // raiseId => raisePlan, all raise plan info\n    mapping(uint256 => RaisePlan) private plans;\n    \n    // endPlan, Need to move active to inactive array\n    function endPlan(uint64 _raiseID) external noDelegateCall returns (bool) {\n        RaisePlan memory plan = plans[_raiseID];\n        require(plan.sponsor == tx.origin, \"END_PLAN_ORIGIN_ERROR\");\n        delete activePlan[plan.minerId];\n        inactivePlan[plan.minerId].push(plan.raiseId);\n        return true;\n    }\n\n    // create new raise plan\n    function createRaisePlan(RaiseInfo memory _raiseInfo, NodeInfo memory _nodeInfo) payable external noDelegateCall returns (address planAddress) {\n        _raiseInfo.id = ++raiseID;\n        require(activePlan[_nodeInfo.minerID] == 0, \"miner already exists\");\n        planAddress = deploy(++raiseID, _raiseInfo, _nodeInfo);\n        emit eCreateRaisePlan(planAddress, msg.sender, msg.value, _raiseInfo, _nodeInfo, _raiseInfo.id);\n    }\n\n    // depoly raise plan\n    function deploy(uint256 _raiseID, RaiseInfo memory _raiseInfo, NodeInfo memory _nodeInfo) internal returns (address) {\n        return address(new LetsFilRaisePlan{\n                salt: keccak256(abi.encode(raiseID)), \n                value: msg.value\n            }(_raiseID, _raiseInfo, _nodeInfo));\n    }\n}\n\n"
+    },
+    "contracts/LetsFilRaisePlan.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\nimport \"./interfaces/ILetsFilRaisePlan.sol\";\nimport \"./interfaces/ILetsFilRaiseInfo.sol\";\n\nenum RaiseState { \n    WaitingStart,   \n    WaitingPayOPSSecurityFund,\n    WaitingSPSign, \n    Raising,  \n    Closed,  \n    Success,\n    Failure   \n}\n\nenum NodeState {\n    WaitingStart,\n    Started,\n    Delayed,\n    End,\n    Success,\n    Failure,\n    Terminate\n}\n\n\ncontract LetsFilRaisePlan is ILetsFilRaisePlan {\n\n    uint256 public immutable PLEDGE_MIN_AMOUNT = 10 ether;\n\n    RaiseState public raiseState;\n    NodeState public nodeState;\n\n    uint256 public raiseID;\n    RaiseInfo public raiseInfo;\n    NodeInfo public nodeInfo;\n    uint256 public totalReward;\n    uint256 public vestTotalReward;\n\n    uint256 public pledgeTotalAmount;\n    mapping(address => uint256) public pledgeRecord;\n    mapping(address => uint256) public withdrawRecord;\n\n    uint64 public startSealTime;\n    uint256 public sealUsedAmount;\n\n    // events\n    event eDepositOPSSecurityFund(uint256 raiseID, address sender, uint256 amount);\n\n    // errors\n    string constant PERMISSION_ERROR = \"No permission\";\n\n    constructor(uint256 _raiseID, RaiseInfo memory _raiseInfo, NodeInfo memory _nodeInfo) payable {\n        raiseID = _raiseID;\n        raiseInfo = _raiseInfo;\n        nodeInfo = _nodeInfo;\n        raiseState = RaiseState.WaitingPayOPSSecurityFund;\n    }\n\n    function getBalance() public view returns (uint256) {\n        return address(this).balance;\n    }\n\n    function specifyOpsPayer(address payer) external {\n        require(msg.sender == raiseInfo.sponsor, PERMISSION_ERROR);\n        nodeInfo.opsSecurityFundPayer = payer;\n    }\n\n    function payOpsSecurityFund() payable external {\n        require(raiseState == RaiseState.WaitingPayOPSSecurityFund, \"Raise state must be WaitingPayOPSSecurityFund\");\n        require(msg.value == nodeInfo.opsSecurityFund, \"Wrong ops security fund\");\n        require(msg.sender == nodeInfo.opsSecurityFundPayer, PERMISSION_ERROR);\n        require(pledgeRecord[msg.sender] == 0, \"OPSSecurityFund has been paid\");\n\n        pledgeRecord[msg.sender] = msg.value;\n        pledgeTotalAmount = msg.value;\n\n        raiseState = RaiseState.WaitingSPSign;\n        emit eDepositOPSSecurityFund(raiseID, msg.sender, msg.value);\n    }\n\n    \n}"
+    },
+    "contracts/Lock.sol": {
+      "content": "// SPDX-License-Identifier: UNLICENSED\npragma solidity ^0.8.9;\n\n// Uncomment this line to use console.log\n// import \"hardhat/console.sol\";\n\ncontract Lock {\n    uint public unlockTime;\n    address payable public owner;\n\n    event Withdrawal(uint amount, uint when);\n\n    constructor(uint _unlockTime) payable {\n        require(\n            block.timestamp < _unlockTime,\n            \"Unlock time should be in the future\"\n        );\n\n        unlockTime = _unlockTime;\n        owner = payable(msg.sender);\n    }\n\n    function withdraw() public {\n        // Uncomment this line, and the import of \"hardhat/console.sol\", to print a log in your terminal\n        // console.log(\"Unlock time is %o and block timestamp is %o\", unlockTime, block.timestamp);\n\n        require(block.timestamp >= unlockTime, \"You can't withdraw yet\");\n        require(msg.sender == owner, \"You aren't the owner\");\n\n        emit Withdrawal(address(this).balance, block.timestamp);\n\n        owner.transfer(address(this).balance);\n    }\n}\n"
+    },
+    "contracts/NoDelegateCall.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.17;\n\n/// @title Prevents delegatecall to a contract\n/// @notice Base contract that provides a modifier for preventing delegatecall to methods in a child contract\nabstract contract NoDelegateCall {\n    /// @dev The original address of this contract\n    address private immutable original;\n\n    constructor() {\n        // Immutables are computed in the init code of the contract, and then inlined into the deployed bytecode.\n        // In other words, this variable won't change when it's checked at runtime.\n        original = address(this);\n    }\n\n    /// @dev Private method is used instead of inlining into modifier because modifiers are copied into each method,\n    ///     and the use of immutable means the address bytes are copied in every place the modifier is used.\n    function checkNotDelegateCall() private view {\n        require(address(this) == original);\n    }\n\n    /// @notice Prevents delegatecall into the modified method\n    modifier noDelegateCall() {\n        checkNotDelegateCall();\n        _;\n    }\n}\n"
+    }
+  },
+  "settings": {
+    "optimizer": {
+      "enabled": true,
+      "runs": 200,
+      "details": {
+        "yul": false
+      }
+    },
+    "outputSelection": {
+      "*": {
+        "*": [
+          "abi",
+          "evm.bytecode",
+          "evm.deployedBytecode",
+          "evm.methodIdentifiers",
+          "metadata",
+          "devdoc",
+          "userdoc",
+          "storageLayout",
+          "evm.gasEstimates"
+        ],
+        "": [
+          "ast"
+        ]
+      }
+    },
+    "metadata": {
+      "useLiteralContent": true
+    }
+  }
+}
