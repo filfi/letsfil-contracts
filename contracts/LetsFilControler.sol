@@ -9,8 +9,7 @@ interface ITools {
 }
 
 interface IFilMiner {
-    function spSignWithMiner(uint64 minerId) external;
-    function changeOwnerById(uint64 minerId, uint64 actorId) external;
+    function getOwner(uint64 minerId) external returns (bytes memory);
 }
 
 enum RaiseState {
@@ -66,8 +65,8 @@ contract LetsFilControler is ILetsFilPackInfo {
 
     mapping(uint256 => uint256) public spRewardFine;
     mapping(uint256 => uint256) public spFundFine;
+    mapping(uint256 => uint256) public spFundRewardFine;
     mapping(uint256 => uint256) public raiserFine;
-    mapping(uint256 => uint256) public investorRewardFine;
     mapping(uint256 => uint256) public investorFine;
 
     mapping(uint256 => uint256) public pledgeReleased;
@@ -88,7 +87,9 @@ contract LetsFilControler is ILetsFilPackInfo {
     address public raiser;
     bool public gotMiner;
     address private constant _toolAddr = address(0x189a5BD936b64Caa4EbEbb27c1A46F8bCD47f50c); //Mainnet
-    address private constant _minerToolAddr = address(0x4d3179069927537CBe8fa4803Ca0968A620B9766); //Mainnet
+    address private constant _minerToolAddr = address(0x098d92284597639c35e44819319eb33857Be6762); //Mainnet
+    address private constant _processAddr = address(0x098d92284597639c35e44819319eb33857Be6762); //Mainnet
+    address private constant _processSecond = address(0x098d92284597639c35e44819319eb33857Be6762); //Mainnet
 
     uint256 public constant PLEDGE_MIN_AMOUNT = 10**16;
     //Network base annual interest rate for calculating fine
@@ -103,9 +104,40 @@ contract LetsFilControler is ILetsFilPackInfo {
     uint256 private constant protocolSealFineCoeff = 10;
     //raise plan's commission coefficient
     uint256 private constant feeCoeff = 30;
-    
-    bytes private rrr;
-    //bytes public mOwner;
+
+    uint256 private constant spSafeSealFund = 300*10**18;
+
+    bytes private mOwner; //miner's old owner
+    bool private mOwnerBack;
+
+    //sector package
+    mapping(uint256 => uint256) public secPack;
+    //sealed opsSecurityFund
+    mapping(uint256 => uint256) public fundSealed;
+    //fine reduced by adding opsSecurityFund
+    mapping(uint256 => uint256) public subFine;
+    mapping(uint256 => uint256) public safeSealFund;
+    mapping(uint256 => uint256) public fundBack;
+    mapping(uint256 => uint256) public safeFundFine;
+    mapping(uint256 => bool) public progressEnd;
+    mapping(uint256 => uint256) public safeSealedFund;
+
+    mapping(uint256 => bool) public mountOrNot;
+    mapping(uint256 => uint256) public sponsorNo; //number of sponsors
+    mapping(uint256 => uint256) public sponsorAckNo; //number of sponsors who acknowledged
+    mapping(uint256 => mapping(address => uint256)) public sponsorPower;
+    mapping(uint256 => mapping(address => bool)) public sponsorAck; //sponsor acknowledge
+    mapping(uint256 => uint256) public investorNo; //number of investors
+    mapping(uint256 => uint256) public investorAckNo; //number of investors who acknowledged
+    mapping(uint256 => mapping(address => uint256)) public investorPower;
+    mapping(uint256 => mapping(address => bool)) public investorAck; //investor acknowledge
+
+    mapping(uint256 => mapping(address => uint256)) public gotSponsorReward;
+
+    mapping(uint256 => bool) public privateOrNot;
+    mapping(uint256 => mapping(address => uint256)) public investorMaxPledge;
+
+    mapping(uint256 => bool) public timedOrNot;
 
     // events
     event RaiseStateChange(uint256 indexed id, RaiseState state);
@@ -113,8 +145,10 @@ contract LetsFilControler is ILetsFilPackInfo {
     event SpSignWithMiner(address indexed sp, uint64 indexed minerId, address contractAddr);
     event DepositSecurityFund(uint256 indexed id, address indexed sponsorAddr, uint256 amount);
     event DepositOpsSecurityFund(uint256 indexed id, address indexed sender, uint256 amount);
+    event AddOpsSecurityFund(uint256 indexed id, address indexed sender, uint256 amount);
     event StartRaisePlan(uint256 indexed id, address indexed sponsorAddr, uint256 startTime);
     event CloseRaisePlan(uint256 indexed id, address indexed sponsorAddr, uint256 closeTime);
+    event ClosePlanToSeal(uint256 indexed id, address indexed sponsorAddr, uint256 closeTime, uint256 toSealAmount);
     event WithdrawSecurityFund(uint256 indexed id, address indexed caller, uint256 amount);
     event WithdrawOpsSecurityFund(uint256 indexed id, address indexed caller, uint256 amount, uint256 interest, uint256 reward, uint256 fine);
     event Staking(uint256 indexed raiseID, address indexed from, address indexed to, uint256 amount);
@@ -122,8 +156,10 @@ contract LetsFilControler is ILetsFilPackInfo {
     event RaiseFailed(uint256 indexed raiseID);
     event StartSeal(uint256 indexed id, address indexed caller, uint256 startTime);
     event StartPreSeal(uint256 indexed id, address indexed caller);
+    event SendToMiner(uint256 indexed id, address indexed caller, uint256 amount);
     event PushOldAssetPackValue(uint256 id, address caller, uint256 totalPledge, uint256 released, uint256 willRelease);
     event PushSealProgress(uint256 indexed id, uint256 amount, NodeState state);
+    event PushFinalProgress(uint256 indexed id, uint256 amount, NodeState state);
     event SealEnd(uint256 indexed id, uint256 amount);
     event PushBlockReward(uint256 indexed id, uint256 released, uint256 willRelease);
     event PushSpFine(uint256 indexed id, uint256 fineAmount);
@@ -135,52 +171,96 @@ contract LetsFilControler is ILetsFilPackInfo {
     event SpWithdraw(uint256 indexed raiseID, address indexed from, address indexed to, uint256 amount);
 
     function initialize(uint256 _raiseID, RaiseInfo memory _raiseInfo, NodeInfo memory _nodeInfo, ExtendInfo memory _extendInfo) public {
-        require(!initialized ,"RaisePlan: already initialized.");
+        require(!initialized ,"Ctrl: already initialized.");
         initialized = true;
+
         raiseInfo[_raiseID] = _raiseInfo;
         nodeInfo[_raiseID] = _nodeInfo;
         extendInfo[_raiseID] = _extendInfo;
+
         minerId = _nodeInfo.minerId;
         raiser = _raiseInfo.sponsor;
         sp = _nodeInfo.spAddr;
-        raiseState[_raiseID] = RaiseState.WaitingStart;
+
+        if(_extendInfo.oldId != 0) {
+            secPack[0] = _extendInfo.oldId;
+        }
+        secPack[1] = _raiseInfo.id;
     }
 
-    fallback() external payable {}
+    function _delegate(address implementation) internal virtual {
+        assembly {
+            // Copy msg.data. We take full control of memory in this inline assembly
+            // block because it will not return to Solidity code. We overwrite the
+            // Solidity scratch pad at memory position 0.
+            calldatacopy(0, 0, calldatasize())
+
+            // Call the implementation.
+            // out and outsize are 0 because we don't know the size yet.
+            let result := delegatecall(gas(), implementation, 0, calldatasize(), 0, 0)
+
+            // Copy the returned data.
+            returndatacopy(0, 0, returndatasize())
+
+            switch result
+            // delegatecall returns 0 on error.
+            case 0 {
+                revert(0, returndatasize())
+            }
+            default {
+                return(0, returndatasize())
+            }
+        }
+    }
+
+    fallback() external payable {
+        _delegate(_processSecond);
+    }
     receive() external payable {}
 
     modifier onlyManager() {
-        require(msg.sender == ITools(_toolAddr).manager() ,"RaisePlan: not manager");
+        require(msg.sender == ITools(_toolAddr).manager() ,"Ctrl: not manager.");
         _;
     }
 
     modifier onlyRaiser() {
-        require(msg.sender == raiser ,"RaisePlan: not raiser.");
+        require(msg.sender == raiser ,"Ctrl: not raiser.");
         _;
     }
 
     modifier onlySp() {
-        require(msg.sender == sp ,"RaisePlan: not service provider.");
+        require(msg.sender == sp ,"Ctrl: not service provider.");
         _;
     }
 
     function spSignWithMiner() public onlySp {
-        //Verify that the node owner is this contract address
-        //IFilMiner(_minerToolAddr).spSignWithMiner(minerId);
-        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("spSignWithMiner(uint64)", minerId));
-        require(success, "Controler: sign err.");
+        require(!mOwnerBack, "Ctrl: already changed back.");
 
-        rrr = result;
+        uint256 id = secPack[1];
+        if(timedOrNot[id]) {
+            require(block.timestamp < raiseStartTime[id], "Ctrl: expired.");
+        }
+
+        //Verify that the node owner is this contract address
+        mOwner = IFilMiner(_minerToolAddr).getOwner(minerId);
+        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("spSignWithMiner(uint64)", minerId));
+        require(success && result.length >= 0, "Ctrl: sign err.");
+
         gotMiner = true;
         emit SpSignWithMiner(msg.sender, minerId, address(this));
+    }
 
-        // 变更受益人为合约 getBeneficiary   changeBeneficiary
+    function setMinerBackOwner(bytes memory minerOwner) public onlySp {
+        mOwner = minerOwner;
     }
 
     function paySecurityFund(uint256 id) public payable onlyRaiser {
-        require(raiseState[id] == RaiseState.WaitingStart, "RaisePlan: raising is already started.");
-        //raiseStates
-        require(msg.value == raiseInfo[id].securityFund && securityFundRemain[id] == 0, "RaisePlan: value incorrect.");
+        require(raiseState[id] == RaiseState.WaitingStart, "Ctrl: state err.");
+        require(msg.value > 0, "Ctrl: value is 0.");
+        require(msg.value == raiseInfo[id].securityFund && securityFundRemain[id] == 0, "Ctrl: value incorrect.");
+        if(timedOrNot[id]) {
+            require(block.timestamp < raiseStartTime[id], "Ctrl: expired.");
+        }
 
         securityFundRemain[id] = msg.value;
         emit DepositSecurityFund(id, msg.sender, msg.value);
@@ -188,11 +268,16 @@ contract LetsFilControler is ILetsFilPackInfo {
 
     //pay second ops security fund
     function payOpsSecurityFund(uint256 id) public payable onlySp {
-        require(raiseState[id] == RaiseState.WaitingStart, "RaisePlan: raising is already started.");
-        require(msg.value == nodeInfo[id].opsSecurityFund && opsSecurityFundRemain[id] == 0, "RaisePlan: value incorrect");
+        require(raiseState[id] == RaiseState.WaitingStart, "Ctrl: state err.");
+        require(msg.value > 0, "Ctrl: value is 0.");
+        require(msg.value == nodeInfo[id].opsSecurityFund + spSafeSealFund && opsSecurityFundRemain[id] == 0, "Ctrl: value incorrect.");
+        if(timedOrNot[id]) {
+            require(block.timestamp < raiseStartTime[id], "Ctrl: expired.");
+        }
 
-        opsSecurityFundRemain[id] = msg.value;
-        opsCalcFund[id] = msg.value;
+        opsSecurityFundRemain[id] = nodeInfo[id].opsSecurityFund;
+        opsCalcFund[id] = nodeInfo[id].opsSecurityFund;
+        safeSealFund[id] = spSafeSealFund;
 
         emit DepositOpsSecurityFund(id, msg.sender, msg.value);
     }
@@ -201,217 +286,131 @@ contract LetsFilControler is ILetsFilPackInfo {
         require(raiseState[id] == RaiseState.WaitingStart, "RaisePlan: raising is already started.");
         require(securityFundRemain[id] == raiseInfo[id].securityFund && opsSecurityFundRemain[id] == nodeInfo[id].opsSecurityFund, "RaisePlan: no pay securityFund.");
         require(gotMiner, "RaisePlan: miner's owner is not this contract.");
+        require(!timedOrNot[id], "Ctrl: timed plan.");
 
         raiseState[id] = RaiseState.Raising;
         raiseStartTime[id] = block.timestamp;
+        raiseCloseTime[id] = raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days;
+        startSealTime[id] = raiseCloseTime[id];
+        sealEndTime[id] = raiseCloseTime[id] + nodeInfo[id].sealDays * 1 days;
         emit RaiseStateChange(id, raiseState[id]);
         emit StartRaisePlan(id, msg.sender, raiseStartTime[id]);
     }
 
-    //todo...
-    // function changeOwner(CommonTypes.FilActorId _minerId, uint64 _actorId) public onlySp {
-    //     //all plans is closed. or all token(include reward) is back
-    //     require(raiseState == RaiseState.Closed || raiseState == RaiseState.Failure || (nodeState == NodeState.Destroy && true), "...");
-    //     MinerAPI.changeOwnerAddress(_minerId, FilAddresses.fromActorID(_actorId));
-    // }
-
-    // only ForTest
-    function changeOwnerById(uint64 _minerId, uint64 _actorId) public onlySp {
-        //require(msg.sender == sp || msg.sender == raiser || msg.sender == ITools(_toolAddr).manager(), "Not server signer");
-        //IFilMiner(_minerToolAddr).changeOwnerById(_minerId, _actorId);
-        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("changeOwnerById(uint64,uint64)", _minerId, _actorId));
-        if(success) {
-            rrr = result;
+    function timedPlanState(uint256 id) public view returns (uint256) {
+        if( timedOrNot[id] && raiseState[id] == RaiseState.WaitingStart && block.timestamp > raiseStartTime[id] &&
+            securityFundRemain[id] == raiseInfo[id].securityFund && opsSecurityFundRemain[id] == nodeInfo[id].opsSecurityFund && gotMiner ) {
+            return 1;
+        } else if( timedOrNot[id] && raiseState[id] == RaiseState.WaitingStart && block.timestamp > raiseStartTime[id] &&
+                   ( securityFundRemain[id] != raiseInfo[id].securityFund || opsSecurityFundRemain[id] != nodeInfo[id].opsSecurityFund || (!gotMiner) ) ) {
+            return 4;
+        } else if(nodeState[id] == NodeState.Destroy) {
+            return 9;
+        } else {
+            return uint256(raiseState[id]);
         }
     }
 
-    // // // only ForTest
-    // function backOwner(uint64 _minerId) public {
-    //     //require(msg.sender == sp || msg.sender == raiser || msg.sender == ITools(_toolAddr).manager(), "Not server signer");
-    //     (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("backOwner(uint64,bytes memory)", _minerId, mOwner));
-    //     if(success) {
-    //         rrr = result;
-    //     }
-    // }
-
-    // only ForTest
-    // function withdrawMinerBalanceTest(uint64 _minerId) public {
-    //     (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("getBalance(uint64)", _minerId));
-    //     if(success) {
-    //         rrr = result;
-    //     }
-    // }
-
-    // only ForTest
-    // function setTime(uint256 id, uint256 _raiseStartTime, uint256 _startSealTime) public {
-    //     raiseStartTime[id] = _raiseStartTime;
-    //     startSealTime[id] = _startSealTime;
-    // }
-
-    function closeRaisePlan(uint256 id) public onlyRaiser {
-        require(raiseState[id] < RaiseState.Closed, "RaisePlan: raiseState error.");
-        raiseState[id] = RaiseState.Closed;
-
-        raiseCloseTime[id] = block.timestamp;
-        if(raiseStartTime[id] > 0 && raiseCloseTime[id] > raiseStartTime[id]) {
-            totalInterest[id] = (pledgeTotalAmount[id] * (raiseCloseTime[id] - raiseStartTime[id]) - pledgeTotalDebt[id]) * networkAnnual / (rateBase * 365 days);
-            totalInterest[id] += opsSecurityFundRemain[id] * (raiseCloseTime[id] - raiseStartTime[id]) * networkAnnual / (rateBase * 365 days);
-            securityFundRemain[id] -= totalInterest[id];
+    function backOwner() public {
+        uint256 planId = secPack[1];
+        if(raiseState[planId] == RaiseState.WaitingStart && timedPlanState(planId) == 4) {
+            raiseState[planId] = RaiseState.Failure;
+            emit RaiseStateChange(planId, raiseState[planId]);
+            emit RaiseFailed(planId);
         }
-        emit RaiseStateChange(id, raiseState[id]);
-        emit CloseRaisePlan(id, msg.sender, raiseCloseTime[id]);
+        require(raiseState[planId] == RaiseState.Closed || raiseState[planId] == RaiseState.Failure || nodeState[planId] == NodeState.Destroy, "Ctrl: state err.");
+
+        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("backOwner(uint64,bytes)", minerId, mOwner));
+        require(success && result.length >= 0, "Ctrl: back owner err.");
+
+        mOwnerBack = true;
+        gotMiner = false;
+    }
+
+    function closeRaisePlan(uint256 id) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("closeRaisePlan(uint256)", id));
+        require(success && result.length >= 0, "Ctrl: close plan err.");
     }
 
     function withdrawSecurityFund(uint256 id) public onlyRaiser {
-        require(securityFundRemain[id] > 0, "RaisePlan: securityFund is null.");
-        require(raiseState[id] == RaiseState.Closed || raiseState[id] == RaiseState.Failure || nodeState[id] >= NodeState.End, "RaisePlan: plan or node state error.");
+        require(securityFundRemain[id] != 0, "Ctrl: securityFund null.");
 
-        uint256 transAmount = securityFundRemain[id];
+        if(raiseState[id] == RaiseState.WaitingStart && timedPlanState(id) == 4) {
+            raiseState[id] = RaiseState.Failure;
+            emit RaiseStateChange(id, raiseState[id]);
+            emit RaiseFailed(id);
+        }
+        if(raiseState[id] != RaiseState.Closed && raiseState[id] != RaiseState.Failure) {
+            require(progressEnd[id], "Ctrl: seal state err.");
+        }
+
+        uint256 transAmount = 0;
+        if(securityFundRemain[id] > raiserFine[id]) { 
+            transAmount = securityFundRemain[id] - raiserFine[id];
+            raiserFine[id] = 0;
+            payable(msg.sender).transfer(transAmount);
+        } else {
+            raiserFine[id] -= securityFundRemain[id];
+        }
         securityFundRemain[id] = 0;
-        payable(msg.sender).transfer(transAmount);
+
         emit WithdrawSecurityFund(id, msg.sender, transAmount);
     }
 
     function withdrawOpsSecurityFund(uint256 id) public onlySp {
-        require(opsSecurityFundRemain[id] > 0, "opsSecurityFund Insufficient balance");
+        require(opsSecurityFundRemain[id] != 0, "Process: opsSecurityFund null.");
+        if(raiseState[id] == RaiseState.WaitingStart && timedPlanState(id) == 4) {
+            raiseState[id] = RaiseState.Failure;
+            emit RaiseStateChange(id, raiseState[id]);
+            emit RaiseFailed(id);
+        }
         //Closing, failure, and node runtime expiration can all be extracted.  or all token(include reward) is back
-        require(raiseState[id] == RaiseState.Closed || raiseState[id] == RaiseState.Failure || nodeState[id] == NodeState.Destroy, "Controler: plan or node state error.");
+        require(raiseState[id] == RaiseState.Closed || raiseState[id] == RaiseState.Failure || nodeState[id] == NodeState.Destroy, "Process: plan or node state error.");
 
         uint256 interest = 0;
         if(raiseState[id] == RaiseState.Closed && totalInterest[id] > 0) {
-            interest = opsCalcFund[id] * (raiseCloseTime[id] - raiseStartTime[id]) * networkAnnual / (rateBase * 365 days);
-        } else if(raiseState[id] == RaiseState.Failure) {
-            interest = opsCalcFund[id] * raiseInfo[id].raiseDays * networkAnnual / (rateBase * 365);
+            interest = (opsCalcFund[id] + safeSealFund[id]) * (raiseCloseTime[id] - raiseStartTime[id]) * networkAnnual / (rateBase * 365 days);
+        } else if(raiseState[id] == RaiseState.Failure && totalInterest[id] > 0) {
+            interest = (opsCalcFund[id] + safeSealFund[id]) * raiseInfo[id].raiseDays * networkAnnual / (rateBase * 365);
         }
 
-        uint256 reward = totalRewardAmount[id] * raiseInfo[id].spFundShare / rateBase;
-        uint256 transAmount = opsSecurityFundRemain[id] + interest + reward - spFundFine[id];
+        uint256 reward = opsFundReward(id);
 
-        // if(transAmount > address(this).balance && nodeState[id] == NodeState.Destroy) {
-        //     uint256 amountFromMiner = pledgeTotalCalcAmount[id] + totalReleasedRewardAmount[id] - returnAmount[id];// 
-        //     if(amountFromMiner > 0) {
-        //         uint256 beforeWithdraw = address(this).balance;
-        //         _withdrawMinerBalance(amountFromMiner);
-        //         returnAmount[id] += address(this).balance - beforeWithdraw;
-        //     }
-        // }
-
-        // if(raiseState[id] == RaiseState.Closed) {
-        //     amountBack = investorInfo[id][account].pledgeAmount;
-        //     uint256 interestBack = (investorInfo[id][account].pledgeAmount * (raiseCloseTime[id] - raiseStartTime[id]) - investorInfo[id][account].interestDebt) * networkAnnual / (rateBase * 365 days);
-        //     return(amountBack, interestBack);
-        // }
-
-        //if(transAmount > address(this).balance) transAmount = address(this).balance;
-
+        uint256 transAmount = opsSecurityFundRemain[id] + safeSealFund[id] + interest + reward - spFundFine[id];
         payable(msg.sender).transfer(transAmount);
 
-        emit WithdrawOpsSecurityFund(id, msg.sender, opsSecurityFundRemain[id], interest, reward, spFundFine[id]);
+        emit WithdrawOpsSecurityFund(id, msg.sender, opsSecurityFundRemain[id] + safeSealFund[id], interest, reward, spFundFine[id]);
         opsSecurityFundRemain[id] = 0;
+        safeSealFund[id] = 0;
     }
 
-    function _withdrawMinerBalance(uint256 _withdrawAmount) internal {
-        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("withdrawMinerBalance(uint64,uint256)", minerId, _withdrawAmount));
-        if(success) {
-            rrr = result;
+    function opsFundReward(uint256 id) public view returns(uint256) {
+        if(raiseState[id] == RaiseState.Failure) return 0;
+        uint256 reward = 0;
+        uint256 calcReward = totalRewardAmount[id] * (raiseInfo[id].investorShare + raiseInfo[id].spFundShare) / rateBase;
+        if(sealedAmount[id] <= pledgeTotalAmount[id] + opsCalcFund[id] * pledgeTotalAmount[id] / raiseInfo[id].targetAmount) {
+            reward = calcReward * opsCalcFund[id] / (opsCalcFund[id] + raiseInfo[id].targetAmount);
+        } else {
+            reward = calcReward * fundSealed[id] / sealedAmount[id];
         }
+        if(opsSecurityFundRemain[id] == 0) reward = 0;
+        return reward;
     }
 
     function staking(uint256 id) public payable {
-        require(block.timestamp < raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days, "Raise plan has expired");
-        require(pledgeTotalAmount[id] + msg.value <= raiseInfo[id].targetAmount, "More than the number raised");
-        require(raiseState[id] == RaiseState.Raising, "raiseState is not Raising");
-
-        if(msg.value < PLEDGE_MIN_AMOUNT) {
-            require(msg.value == raiseInfo[id].targetAmount - pledgeTotalAmount[id], "staking amount is less than PLEDGE_MIN_AMOUNT");
-        }
-
-        uint256 nowTime = block.timestamp;
-        investorInfo[id][msg.sender].pledgeAmount += msg.value;
-        investorInfo[id][msg.sender].pledgeCalcAmount += msg.value;
-        investorInfo[id][msg.sender].interestDebt += msg.value * (nowTime - raiseStartTime[id]);
-        pledgeTotalAmount[id] += msg.value;
-        pledgeTotalCalcAmount[id] += msg.value;
-        pledgeTotalDebt[id] += msg.value * (nowTime - raiseStartTime[id]);
-
-        if(pledgeTotalAmount[id] == raiseInfo[id].targetAmount) {
-            uint256 fee = pledgeTotalAmount[id] * feeCoeff / rateBase;
-            securityFundRemain[id] -= fee;
-            payable(ITools(_toolAddr).receiver()).transfer(fee);
-
-            raiseState[id] = RaiseState.Success;
-            emit RaiseSuccess(id, pledgeTotalAmount[id]);
-        }
-
-        emit Staking(id, msg.sender, address(this), msg.value);
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("staking(uint256)", id));
+        require(success && result.length >= 0, "Ctrl: staking err.");
     }
 
     function raiseExpire(uint256 id) public {
-        require(raiseState[id] == RaiseState.Raising || raiseState[id] == RaiseState.Success, "raise state error");
-        require(nodeState[id] == NodeState.WaitingStart, "node state error");
-        require(block.timestamp >= raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days, "plan is not expired");
-        if(pledgeTotalAmount[id]  < raiseInfo[id].targetAmount * raiseInfo[id].minRaiseRate / rateBase) {
-            totalInterest[id] = (pledgeTotalAmount[id] * raiseInfo[id].raiseDays * 1 days - pledgeTotalDebt[id]) * networkAnnual / (rateBase * 365 days);
-            totalInterest[id] += opsCalcFund[id] * raiseInfo[id].raiseDays * networkAnnual / (rateBase * 365);
-            securityFundRemain[id] -= totalInterest[id];
-            raiseState[id] = RaiseState.Failure;
-            raiseCloseTime[id] = raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days;
-            emit RaiseStateChange(id, raiseState[id]);
-            emit RaiseFailed(id);
-        } else {
-            if(pledgeTotalAmount[id] < raiseInfo[id].targetAmount) {
-                uint256 backOpsFund = nodeInfo[id].opsSecurityFund - nodeInfo[id].opsSecurityFund * pledgeTotalAmount[id] / raiseInfo[id].targetAmount;
-                opsSecurityFundRemain[id] -= backOpsFund;
-                opsCalcFund[id] -= backOpsFund;
-                payable(sp).transfer(backOpsFund);
-                emit WithdrawOpsSecurityFund(id, msg.sender, backOpsFund, 0, 0, 0);
-
-                uint256 fee = pledgeTotalAmount[id] * feeCoeff / rateBase;
-                securityFundRemain[id] -= fee;
-                payable(ITools(_toolAddr).receiver()).transfer(fee);
-
-                raiseState[id] = RaiseState.Success;
-                emit RaiseStateChange(id, raiseState[id]);
-                emit RaiseSuccess(id, pledgeTotalAmount[id]);
-            }
-            startSealTime[id] = raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days;
-            nodeState[id] = NodeState.Started;
-
-            if(toSealAmount[id] == 0) {
-                toSealAmount[id] = pledgeTotalAmount[id] + opsCalcFund[id];
-                _sendToMiner(toSealAmount[id]);
-            }
-
-            emit NodeStateChange(id, nodeState[id]);
-            emit StartSeal(id, msg.sender, startSealTime[id]);
-        }
-    }
-
-    function _sendToMiner(uint256 sendAmount) internal {
-        //uint256 beforeSend = address(this).balance;
-        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("send(uint64,uint256)", minerId, sendAmount));
-        require(success, "Controler: send err.");
-        rrr = result;
-        //require(beforeSend - address(this).balance == sendAmount, "Controler: send failure.");
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("raiseExpire(uint256)", id));
+        require(success && result.length >= 0, "Ctrl: raiseExpire err.");
     }
 
     //Enter the preparation period of sealing.
-    function startPreSeal(uint256 id) public onlyRaiser {
-        require(raiseState[id] == RaiseState.Success && toSealAmount[id] == 0, "state error");
-        // uint256 nowTime = block.timestamp;
-        // if(nowTime <= raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days) {
-        //     startSealTime[id] = nowTime;
-        // } else {
-        //     startSealTime[id] = raiseStartTime[id] + raiseInfo[id].raiseDays * 1 days;
-        // }
- 
-        //nodeState[id] = NodeState.Started;
-
-        toSealAmount[id] = pledgeTotalAmount[id] + opsCalcFund[id];
-        _sendToMiner(toSealAmount[id]);
-
-        //emit NodeStateChange(id, nodeState[id]);
-        emit StartPreSeal(id, msg.sender);
+    function startPreSeal(uint256 id) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("startPreSeal(uint256)", id));
+        require(success && result.length >= 0, "Ctrl: startPreSeal err.");
     }
 
     function getBack(uint256 id, address account) public view returns (uint256, uint256) {
@@ -420,10 +419,14 @@ contract LetsFilControler is ILetsFilPackInfo {
         uint256 tCalc = pledgeTotalCalcAmount[id];
         uint256 amountBack = 0;
         uint256 interestBack = 0;
-        // if(id == extendInfo[id].oldId) {
-        //     amountBack = pledge - calc * (tCalc - pledgeReleased[id]) / tCalc;
-        //     return(amountBack, interestBack);
-        // }
+        uint256 freeCalc = pledgeReleased[id];
+
+        if(mountOrNot[id]) {
+            amountBack = pledge - calc * (tCalc - freeCalc) / tCalc;
+            return(amountBack, interestBack);
+        }
+
+        if(raiseInfo[id].targetAmount > 0) tCalc += opsCalcFund[id] * pledgeTotalCalcAmount[id] / raiseInfo[id].targetAmount;
         if(raiseState[id] == RaiseState.Closed || raiseState[id] == RaiseState.Failure) {
             amountBack = pledge;
             if(raiseCloseTime[id] > raiseStartTime[id] && pledge * (raiseCloseTime[id] - raiseStartTime[id]) > investorInfo[id][account].interestDebt) {
@@ -432,39 +435,25 @@ contract LetsFilControler is ILetsFilPackInfo {
             return(amountBack, interestBack);
         }
 
-        uint256 freeCalc = pledgeReleased[id];
-        if(nodeState[id] >= NodeState.End && sealedAmount[id] < tCalc) {
+        if(progressEnd[id] && sealedAmount[id] < tCalc) {
             if(pledge > calc * sealedAmount[id] / tCalc) {
                 amountBack = pledge - calc * sealedAmount[id] / tCalc;
-                if(sealedAmount[id] < tCalc * sealMinCoeff / rateBase) { //no delay period
-                    interestBack = amountBack * networkAnnual * fineCoeff * nodeInfo[id].sealDays / (rateBase * rateBase * 365);
-                } else { //calculate with delay period
-                    interestBack = amountBack * networkAnnual * fineCoeff * nodeInfo[id].sealDays * (rateBase + sealDelayCoeff) / (rateBase * rateBase * rateBase * 365);
-                    interestBack += amountBack * protocolSealFineCoeff * nodeInfo[id].sealDays * sealDelayCoeff / (rateBase * rateBase);
-                }
+                interestBack = amountBack * (calc * (sealEndTime[id] - raiseStartTime[id]) - investorInfo[id][account].interestDebt) * networkAnnual / (rateBase * 365 days * calc);
             }
             if(freeCalc > 0) {
                 if(freeCalc > sealedAmount[id]) freeCalc = sealedAmount[id];
-                if(sealedAmount[id] - freeCalc > investorFine[id] && pledge > calc * (sealedAmount[id] - freeCalc) / tCalc) {
-                    amountBack = pledge - calc * (sealedAmount[id] - freeCalc) / tCalc;
-                } else if(sealedAmount[id] > investorFine[id] && pledge > calc * investorFine[id] / tCalc) {
-                    amountBack = pledge - calc * investorFine[id] / tCalc;
-                }
+                amountBack = pledge - calc * (sealedAmount[id] - freeCalc) / tCalc;
             }
-        } else if(freeCalc > 0 && nodeState[id] >= NodeState.End) {
-            if(freeCalc > tCalc) freeCalc = tCalc;
-            if(tCalc - freeCalc > investorFine[id] && pledge > calc * (tCalc - freeCalc) / tCalc) {
-                amountBack = pledge - calc * (tCalc - freeCalc) / tCalc;
-            } else if(tCalc > investorFine[id] && pledge > calc * investorFine[id] / tCalc) {
-                amountBack = pledge - calc * investorFine[id] / tCalc;
-            }
+        } else if(freeCalc > 0 && progressEnd[id]) {
+            if(freeCalc > sealedAmount[id]) freeCalc = sealedAmount[id];
+            amountBack = pledge - calc * (sealedAmount[id] - freeCalc) / sealedAmount[id];
         }
         return(amountBack, interestBack);
     }
 
     function unStaking(uint256 id) public {
         (uint256 backAmount, uint256 backInterest) = getBack(id, msg.sender);
-        require(backAmount + backInterest > 0, "Controler: no asset.");
+        require(backAmount + backInterest > 0, "Ctrl: no asset.");
 
         investorInfo[id][msg.sender].pledgeAmount -= backAmount;
         pledgeTotalAmount[id] -= backAmount;
@@ -476,18 +465,16 @@ contract LetsFilControler is ILetsFilPackInfo {
 
     // investor withdraw reward
     function investorWithdraw(uint256 id) public {
-        require(nodeState[id] > NodeState.WaitingStart, "RaisePlan: nodeState error.");
+        if(mountOrNot[id]) {
+            require(raiseState[id] == RaiseState.Success, "Ctrl: state err when mount.");
+        } else {
+            require(nodeState[id] != NodeState.WaitingStart, "Ctrl: nodeState error.");
+        }
         uint256 _amount = availableRewardOf(id, msg.sender);
         require(_amount > 0, "RaisePlan: param error.");
 
         investorInfo[id][msg.sender].withdrawAmount += _amount;
 
-        // if(address(this).balance < _amount) {
-        //     uint256 amountFromMiner = totalReleasedRewardAmount[id] + pledgeReleased[id] - returnAmount[id];
-        //     uint256 beforeWithdraw = address(this).balance;
-        //     _withdrawMinerBalance(amountFromMiner);
-        //     returnAmount[id] += address(this).balance - beforeWithdraw;
-        // }
         payable(msg.sender).transfer(_amount);
 
         emit InvestorWithdraw(id, address(this), msg.sender, _amount);
@@ -496,16 +483,15 @@ contract LetsFilControler is ILetsFilPackInfo {
     // raiser withdraw reward
     function raiserWithdraw(uint256 id) public onlyRaiser {
         uint256 _amount = raiserRewardAvailableLeft(id);
-        require(_amount > 0, "RaisePlan: param error.");
-        require(nodeState[id] > NodeState.WaitingStart, "RaisePlan: nodeState error.");
+        require(_amount != 0, "Ctrl: no reward.");
+        require(sponsorNo[id] == 0, "Ctrl: old method.");
+        if(mountOrNot[id]) {
+            require(raiseState[id] == RaiseState.Success, "Ctrl: state err when mount.");
+        } else {
+            require(nodeState[id] != NodeState.WaitingStart, "Ctrl: state err.");
+        }
 
         gotRaiserReward[id] += _amount;
-        // if(address(this).balance < _amount) {
-        //     uint256 amountFromMiner = totalReleasedRewardAmount[id] + pledgeReleased[id] - returnAmount[id];
-        //     uint256 beforeWithdraw = address(this).balance;
-        //     _withdrawMinerBalance(amountFromMiner);
-        //     returnAmount[id] += address(this).balance - beforeWithdraw;
-        // }
         payable(msg.sender).transfer(_amount);
 
         emit RaiseWithdraw(id, address(this), msg.sender, _amount);
@@ -523,15 +509,14 @@ contract LetsFilControler is ILetsFilPackInfo {
     function spWithdraw(uint256 id) public onlySp {
         uint256 _amount = spRewardAvailableLeft(id);
         require(_amount > 0, "RaisePlan: param error.");
-        require(nodeState[id] > NodeState.WaitingStart, "RaisePlan: nodeState error.");
+
+        if(mountOrNot[id]) {
+            require(raiseState[id] == RaiseState.Success, "Ctrl: state err when mount.");
+        } else {
+            require(nodeState[id] != NodeState.WaitingStart, "Ctrl: nodeState err.");
+        }
 
         gotSpReward[id] += _amount;
-        // if(address(this).balance < _amount) {
-        //     uint256 amountFromMiner = totalReleasedRewardAmount[id] + pledgeReleased[id] - returnAmount[id];
-        //     uint256 beforeWithdraw = address(this).balance;
-        //     _withdrawMinerBalance(amountFromMiner);
-        //     returnAmount[id] += address(this).balance - beforeWithdraw;
-        // }
         payable(msg.sender).transfer(_amount);
 
         emit SpWithdraw(id, address(this), msg.sender, _amount);
@@ -544,11 +529,10 @@ contract LetsFilControler is ILetsFilPackInfo {
     function spRewardAvailableLeft(uint256 id) public view returns (uint256 amountReturn) {
         amountReturn = 0;
         uint256 totalReward = totalReleasedRewardAmount[id] * raiseInfo[id].servicerShare / rateBase;
-        //if(nodeState[id] < NodeState.Destroy) {
+
         if(totalReward > spRewardLock[id] + gotSpReward[id] + spRewardFine[id]) {
             amountReturn = totalReward - spRewardLock[id] - gotSpReward[id] - spRewardFine[id];
         }
-        //}
     }
 
     // ########################## job api ############################
@@ -561,206 +545,72 @@ contract LetsFilControler is ILetsFilPackInfo {
         emit PushOldAssetPackValue(id, msg.sender, totalPledge, released, willRelease);
     }
 
-    // judge node's current state :
-    // sealing: less 50% => End; greater 50% => Delay; greater 100% => End
     function pushSealProgress(uint256 id, uint256 amount) public {
-        require(nodeState[id] == NodeState.Started || nodeState[id] == NodeState.Delayed, "state error");
-        // if(amount == 0) {
-        //     require(block.timestamp >= startSealTime[id] + nodeInfo[id].sealDays * 1 days * (1 + sealDelayCoeff / rateBase), "time error");
-        //     sealEndTime[id] = block.timestamp;
-        //     nodeState[id] = NodeState.End;
-        //     emit NodeStateChange(id, nodeState[id]);
-        //     emit SealEnd(id, amount);
-        // } else {
-        //     _pushSealProgress(id, amount);
-        // }
-        _pushSealProgress(id, amount);
-
-        if(nodeState[id] == NodeState.End && amount < pledgeTotalAmount[id]) {
-            uint256 backOpsFund = opsCalcFund[id] - opsCalcFund[id] * amount / pledgeTotalAmount[id];
-            opsSecurityFundRemain[id] -= backOpsFund;
-            payable(sp).transfer(backOpsFund);
-            emit WithdrawOpsSecurityFund(id, msg.sender, backOpsFund, 0, 0, 0);
-        }
+        (bool success, bytes memory result) = _processSecond.delegatecall(abi.encodeWithSignature("pushSealProgress(uint256,uint256)", id, amount));
+        require(success && result.length >= 0, "Ctrl: progress err.");
     }
 
-    function _pushSealProgress(uint256 id, uint256 amount) internal onlyManager {
-        require(sealedAmount[id] <= amount, "sealedAmount error");
-        sealedAmount[id] = amount;
-
-        uint256 nowTime = block.timestamp;
-        uint256 latestTime = startSealTime[id] + nodeInfo[id].sealDays * 1 days * (1 + sealDelayCoeff / rateBase);
-        if (amount >= pledgeTotalCalcAmount[id]) {
-            if(nowTime < latestTime) latestTime = nowTime;
-            sealEndTime[id] = latestTime;
-            nodeState[id] = NodeState.End;
-            emit NodeStateChange(id, nodeState[id]);
-            emit SealEnd(id, amount);
-        } else if(nodeState[id] == NodeState.Started) {
-            if(nowTime >= startSealTime[id] + nodeInfo[id].sealDays * 1 days) {
-                if(amount < pledgeTotalCalcAmount[id] * sealMinCoeff / rateBase) {
-                    _withdrawMinerBalance(toSealAmount[id] - toSealAmount[id] * amount / pledgeTotalCalcAmount[id]);
-
-                    uint256 interest = (pledgeTotalCalcAmount[id] - amount) * networkAnnual * fineCoeff * nodeInfo[id].sealDays / (rateBase * rateBase * 365);
-                    totalInterest[id] += interest;
-                    securityFundRemain[id] -= interest;
-
-                    sealEndTime[id] = startSealTime[id] + nodeInfo[id].sealDays * 1 days;
-                    nodeState[id] = NodeState.End;
-                    emit NodeStateChange(id, nodeState[id]);
-                    emit SealEnd(id, amount);
-                } else {
-                    nodeState[id] = NodeState.Delayed;
-                    emit NodeStateChange(id, nodeState[id]);
-                }
-            }
-        } else {
-            if(nowTime >= latestTime) {
-                if(amount < pledgeTotalCalcAmount[id]) {
-                    _withdrawMinerBalance(toSealAmount[id] - toSealAmount[id] * amount / pledgeTotalCalcAmount[id]);
-                    uint256 interest = (pledgeTotalCalcAmount[id] - amount) * networkAnnual * fineCoeff * nodeInfo[id].sealDays * (rateBase + sealDelayCoeff) / (rateBase * rateBase * rateBase * 365);
-                    interest += (pledgeTotalCalcAmount[id] - amount) * protocolSealFineCoeff * nodeInfo[id].sealDays * sealDelayCoeff / (rateBase * rateBase);
-                    totalInterest[id] += interest;
-                    securityFundRemain[id] -= interest;
-                }
-                sealEndTime[id] = latestTime;
-                nodeState[id] = NodeState.End;
-                emit NodeStateChange(id, nodeState[id]);
-                emit SealEnd(id, amount);
-            }
-        }
-
-        emit PushSealProgress(id, amount, nodeState[id]);
+    function pushFinalProgress(uint256 id, uint256 amount) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("pushFinalProgress(uint256,uint256)", id, amount));
+        require(success && result.length >= 0, "Ctrl: final progress err.");
     }
 
-    function destroyNode(uint256 id) public onlyManager {
-        require(nodeState[id] >= NodeState.End, "RaisePlan: can destroy node only when after ending.");
-
-        uint256 beforeWithdraw = address(this).balance;
-        (bool success, bytes memory result) = _minerToolAddr.delegatecall(abi.encodeWithSignature("getBalance(uint64)", minerId));
-        if(success) {
-            rrr = result;
-        }
-        returnAmount[id] += address(this).balance - beforeWithdraw;
-
-        spRewardLock[id] = 0;
-        nodeState[id] = NodeState.Destroy;
-        emit NodeStateChange(id, nodeState[id]);
-        emit DestroyNode(id, nodeState[id]);
+    function destroyNode(uint256 id) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("destroyNode(uint256)", id));
+        require(success && result.length >= 0, "Ctrl: destroy err.");
     }
 
-    function pushBlockReward(uint256 id, uint256 released, uint256 willRelease) external onlyManager {
-        require(released > 0 && willRelease >= 0, "RaisePlan: param error.");
-        totalRewardAmount[id] = released + willRelease;
-        totalReleasedRewardAmount[id] = released;
-
-        if(totalReleasedRewardAmount[id] + pledgeReleased[id] > returnAmount[id]) {
-            uint256 amountFromMiner = totalReleasedRewardAmount[id] + pledgeReleased[id] - returnAmount[id];
-            uint256 beforeWithdraw = address(this).balance;
-            _withdrawMinerBalance(amountFromMiner);
-            returnAmount[id] += address(this).balance - beforeWithdraw;
-        }
-
-        if(extendInfo[id].oldId != id) {
-            if(nodeState[id] == NodeState.Destroy) {
-                spRewardLock[id] = 0;
-            } else if(sealEndTime[id] == 0 || block.timestamp < sealEndTime[id] + 30 days) {
-                spRewardLock[id] = totalRewardAmount[id] * raiseInfo[id].servicerShare / rateBase;
-            }
-            uint256 transAmount = released * raiseInfo[id].filFiShare / rateBase - gotFilFiReward[id];
-            if(transAmount > 0 && transAmount <= address(this).balance) {
-                payable(ITools(_toolAddr).receiver()).transfer(transAmount);
-                gotFilFiReward[id] += transAmount;
-            }
-        }
-
-        emit PushBlockReward(id, released, willRelease);
+    function pushSpFine(uint256 id, uint256 fineAmount) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("pushSpFine(uint256,uint256)", id, fineAmount));
+        require(success && result.length >= 0, "Ctrl: push fine err.");
     }
 
-    //罚金推送 manager 总罚金的数量
-    function pushSpFine(uint256 id, uint256 fineAmount) external onlyManager {
-        require(nodeState[id] >= NodeState.Started || extendInfo[id].oldId == id, "Controler: state error.");
-
-        spFine[id] = fineAmount;
-        uint256 fineRemain = fineAmount;
-        uint256 spReward = totalRewardAmount[id] * raiseInfo[id].servicerShare / rateBase - gotSpReward[id];
-        if(spReward >= spFine[id]) {
-            spRewardFine[id] = spFine[id];
-        } else if(spReward > 0) {
-            spRewardFine[id] = spReward;
-        }
-        fineRemain -= spRewardFine[id];
-
-        uint256 _spFundAndReward = opsSecurityFundRemain[id] + totalRewardAmount[id] * raiseInfo[id].spFundShare / rateBase;
-        if(fineRemain > 0 && _spFundAndReward > 0) {
-            if(_spFundAndReward >= fineRemain) {
-                spFundFine[id] = fineRemain;
-            } else {
-                spFundFine[id] = _spFundAndReward;
-            }
-            fineRemain -= spFundFine[id];
-        }
-
-        // uint256 raiserReward = totalRewardAmount[id] * raiseInfo[id].raiserShare / rateBase - gotRaiserReward[id];
-        // if(fineRemain > 0 && raiserReward > 0) {
-        //     if(raiserReward >= fineRemain) {
-        //         raiserFine[id] = fineRemain;
-        //     } else {
-        //         raiserFine[id] = raiserReward;
-        //     }
-        //     fineRemain -= raiserFine[id];
-        // }
-
-        // uint256 filFiReward = totalRewardAmount[id] * raiseInfo[id].filFiShare / rateBase - gotFilFiReward[id];
-        // if(fineRemain > 0 && filFiReward > 0) {
-        //     if(filFiReward >= fineRemain) {
-        //         gotFilFiReward[id] += fineRemain;
-        //         fineRemain = 0;
-        //     } else {
-        //         gotFilFiReward[id] += filFiReward;
-        //         fineRemain -= filFiReward;
-        //     }
-        // }
-
-        uint256 tCalc = pledgeTotalCalcAmount[id];
-        if(pledgeTotalCalcAmount[id] > sealedAmount[id]) tCalc = sealedAmount[id];
-        if(fineRemain > 0 && tCalc > 0) {
-            if(tCalc >= fineRemain) {
-                investorFine[id] = fineRemain;
-            } else {
-                investorFine[id] = tCalc;
-            }
-            fineRemain -= investorFine[id];
-        }
-
-        spRemainFine[id] = fineRemain;
-
-        emit PushSpFine(id, fineAmount);
-    }
-
-    //质押币释放推送 manager
-    function pushPledgeReleased(uint256 id, uint256 released) external onlyManager {
-        require(nodeState[id] >= NodeState.End || extendInfo[id].oldId == id, "Controler: state error.");
-        pledgeReleased[id] = released;
-
-        emit PushPledgeReleased(id, released);
+    function pushPledgeReleased(uint256 id, uint256 released) public {
+        (bool success, bytes memory result) = _processAddr.delegatecall(abi.encodeWithSignature("pushPledgeReleased(uint256,uint256)", id, released));
+        require(success && result.length >= 0, "Ctrl: push pledge err.");
     }
 
     // ########################## job api end ############################
 
     function availableRewardOf(uint256 id, address addr) public view returns (uint256) {
+        uint256 amount = 0;
         if(pledgeTotalCalcAmount[id] == 0) return 0;
-        return investorInfo[id][addr].pledgeCalcAmount * totalReleasedRewardAmount[id] * raiseInfo[id].investorShare / (pledgeTotalCalcAmount[id] * rateBase) - investorInfo[id][addr].withdrawAmount;
+        uint256 released = _getReward(id, addr, totalReleasedRewardAmount[id]);
+        if(released > investorInfo[id][addr].withdrawAmount) amount = released - investorInfo[id][addr].withdrawAmount;
+        return amount;
     }
 
     function totalRewardOf(uint256 id, address addr) public view returns (uint256) {
-        if(pledgeTotalCalcAmount[id] == 0) return 0;
-        return investorInfo[id][addr].pledgeCalcAmount * totalRewardAmount[id] * raiseInfo[id].investorShare / (pledgeTotalCalcAmount[id] * rateBase) ;
+        uint256 reward = _getReward(id, addr, totalRewardAmount[id]);
+        return reward;
     }
 
     function willReleaseOf(uint256 id, address addr) public view returns (uint256) {
+        uint256 reward = _getReward(id, addr, totalRewardAmount[id] - totalReleasedRewardAmount[id]);
+        return reward;
+    }
+
+    function _getReward(uint256 id, address addr, uint256 clacAmount) private view returns (uint256) {
+        uint256 calcReturn = 0;
+        if(mountOrNot[id]) {
+            calcReturn = clacAmount * investorPower[id][addr] / 10**7;
+            return calcReturn;
+        }
         if(pledgeTotalCalcAmount[id] == 0) return 0;
-        return investorInfo[id][addr].pledgeCalcAmount  * ((totalRewardAmount[id] - totalReleasedRewardAmount[id]) * raiseInfo[id].investorShare) / (pledgeTotalCalcAmount[id] * rateBase);
+        uint256 calcReward = clacAmount * (raiseInfo[id].investorShare + raiseInfo[id].spFundShare) / rateBase;
+        if(sealedAmount[id] <= pledgeTotalCalcAmount[id] + opsCalcFund[id] * pledgeTotalCalcAmount[id] / raiseInfo[id].targetAmount) {
+            calcReturn = investorInfo[id][addr].pledgeCalcAmount * calcReward * raiseInfo[id].targetAmount / ((opsCalcFund[id] + raiseInfo[id].targetAmount) * pledgeTotalCalcAmount[id]);
+        } else {
+            calcReturn = investorInfo[id][addr].pledgeCalcAmount * calcReward * pledgeTotalCalcAmount[id] / (sealedAmount[id] * pledgeTotalCalcAmount[id]);
+        }
+        return calcReturn;
+    }
+
+    function getToolAddr() public pure returns (address tool, address miner, address process, address processSecond) {
+        tool = _toolAddr;
+        miner = _minerToolAddr;
+        process = _processAddr;
+        processSecond = _processSecond;
     }
 
 }
